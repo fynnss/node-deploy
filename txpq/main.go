@@ -47,14 +47,15 @@ var (
 	// Default: 1 BNB — enough for ~47k PQ txs at 10 Gwei gas price, 30k gas each.
 	minBalance = new(big.Int).Mul(big.NewInt(1), big.NewInt(params.Ether))
 
-	endpointFlag  = flag.String("endpoint", defaultEndpoint, "RPC URL")
-	chainIDFlag   = flag.Int64("chainId", defaultChainID, "chain ID")
-	keyfileFlag   = flag.String("keyfile", defaultKeyFile, "path to privkey.hex file")
-	workersFlag   = flag.Int("workers", 1, "number of concurrent senders")
-	intervalFlag  = flag.Duration("interval", 200*time.Millisecond, "interval between sends per worker")
-	durationFlag  = flag.Duration("duration", 0, "total run time, 0 = run forever")
-	toFlag        = flag.String("to", "", "recipient address hex (default: sender sends to self)")
+	endpointFlag   = flag.String("endpoint", defaultEndpoint, "RPC URL")
+	chainIDFlag    = flag.Int64("chainId", defaultChainID, "chain ID")
+	keyfileFlag    = flag.String("keyfile", defaultKeyFile, "path to privkey.hex file")
+	workersFlag    = flag.Int("workers", 1, "number of concurrent senders")
+	intervalFlag   = flag.Duration("interval", 200*time.Millisecond, "interval between sends per worker")
+	durationFlag   = flag.Duration("duration", 0, "total run time, 0 = run forever")
+	toFlag         = flag.String("to", "", "recipient address hex (default: sender sends to self)")
 	fundAmountFlag = flag.String("fund", "10", "BNB to transfer from INIT_HOLDER to PQ address if balance is below minimum (0 = skip)")
+	modeFlag       = flag.String("mode", "pq", "signing mode: pq or secp256k1")
 )
 
 type pqAccount struct {
@@ -77,15 +78,8 @@ func main() {
 	if *intervalFlag <= 0 {
 		exitf("-interval must be > 0")
 	}
-
-	account, err := loadPQAccount(*keyfileFlag)
-	if err != nil {
-		exitf("load PQ account: %v", err)
-	}
-
-	toAddr, err := resolveRecipient(*toFlag, account.Address)
-	if err != nil {
-		exitf("resolve recipient: %v", err)
+	if *modeFlag != "pq" && *modeFlag != "secp256k1" {
+		exitf("-mode must be pq or secp256k1")
 	}
 
 	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -104,6 +98,22 @@ func main() {
 	defer client.Close()
 
 	chainID := big.NewInt(*chainIDFlag)
+
+	if *modeFlag == "secp256k1" {
+		runSecp256k1(ctx, client, chainID)
+		return
+	}
+
+	// --- PQ mode ---
+	account, err := loadPQAccount(*keyfileFlag)
+	if err != nil {
+		exitf("load PQ account: %v", err)
+	}
+
+	toAddr, err := resolveRecipient(*toFlag, account.Address)
+	if err != nil {
+		exitf("resolve recipient: %v", err)
+	}
 
 	fmt.Printf("PQ Sender:  %s\n", account.Address.Hex())
 	fmt.Printf("Recipient:  %s\n", toAddr.Hex())
@@ -138,6 +148,104 @@ func main() {
 	wg.Wait()
 	<-statsDone
 	fmt.Printf("Done — sent=%d errors=%d\n", st.sent.Load(), st.errors.Load())
+}
+
+// runSecp256k1 runs a benchmark using the INIT_HOLDER key with standard EIP-155
+// legacy transactions — structurally identical to PQ mode for a fair comparison.
+func runSecp256k1(ctx context.Context, client *ethclient.Client, chainID *big.Int) {
+	initKey, err := crypto.HexToECDSA(initHolderKeyHex)
+	if err != nil {
+		exitf("load secp256k1 key: %v", err)
+	}
+	senderAddr := crypto.PubkeyToAddress(initKey.PublicKey)
+
+	toAddr, err := resolveRecipient(*toFlag, senderAddr)
+	if err != nil {
+		exitf("resolve recipient: %v", err)
+	}
+
+	fmt.Printf("secp256k1 Sender: %s\n", senderAddr.Hex())
+	fmt.Printf("Recipient:        %s\n", toAddr.Hex())
+	fmt.Printf("Endpoint:         %s\n", *endpointFlag)
+	fmt.Printf("Workers:          %d  Interval: %s\n", *workersFlag, *intervalFlag)
+
+	baseNonce, err := client.PendingNonceAt(ctx, senderAddr)
+	if err != nil {
+		exitf("fetch pending nonce: %v", err)
+	}
+
+	st := &runStats{}
+	var wg sync.WaitGroup
+	for i := 0; i < *workersFlag; i++ {
+		wg.Add(1)
+		go workerSecp256k1(ctx, &wg, client, initKey, senderAddr, toAddr, chainID,
+			uint64(i), uint64(*workersFlag), baseNonce+uint64(i),
+			*intervalFlag, st)
+	}
+
+	statsDone := make(chan struct{})
+	go printStats(ctx, client, senderAddr, st, statsDone)
+
+	wg.Wait()
+	<-statsDone
+	fmt.Printf("Done — sent=%d errors=%d\n", st.sent.Load(), st.errors.Load())
+}
+
+// workerSecp256k1 sends standard EIP-155 legacy transactions.
+func workerSecp256k1(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	client *ethclient.Client,
+	key *ecdsa.PrivateKey,
+	senderAddr common.Address,
+	toAddr common.Address,
+	chainID *big.Int,
+	workerID, stride, startNonce uint64,
+	interval time.Duration,
+	st *runStats,
+) {
+	defer wg.Done()
+
+	signer := types.NewEIP155Signer(chainID)
+	gasPrice := big.NewInt(10 * params.GWei)
+	nonce := startNonce
+
+	send := func() {
+		tx := types.NewTx(&types.LegacyTx{
+			Nonce:    nonce,
+			To:       &toAddr,
+			Value:    big.NewInt(1),
+			Gas:      21_000,
+			GasPrice: new(big.Int).Set(gasPrice),
+		})
+		signed, err := types.SignTx(tx, signer, key)
+		if err != nil {
+			st.errors.Add(1)
+			fmt.Printf("[worker %d] sign error nonce=%d: %v\n", workerID, nonce, err)
+			nonce += stride
+			return
+		}
+		if err := client.SendTransaction(ctx, signed); err != nil {
+			st.errors.Add(1)
+			fmt.Printf("[worker %d] send error nonce=%d: %v\n", workerID, nonce, err)
+			nonce += stride
+			return
+		}
+		st.sent.Add(1)
+		nonce += stride
+	}
+
+	send()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			send()
+		}
+	}
 }
 
 // worker sends PQ transactions on a ticker until ctx is cancelled.
