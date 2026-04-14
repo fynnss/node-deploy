@@ -27,7 +27,7 @@ func main() {
 	}
 	addr := crypto.PQPubkeyToAddress(pubKey)
 
-	if err := writeOutputs(*outFlag, addr.Hex(), hex.EncodeToString(pubKey), hex.EncodeToString(privKey)); err != nil {
+	if err := writeOutputs(*outFlag, addr.Hex(), pubKey, privKey); err != nil {
 		exitf("write outputs: %v", err)
 	}
 
@@ -49,21 +49,27 @@ func generateKeyPair(seedHex string) ([]byte, []byte, error) {
 	return mldsa.GenerateKeyFromSeed(derivedSeed[:])
 }
 
-func writeOutputs(outDir, address, pubKeyHex, privKeyHex string) error {
+func writeOutputs(outDir, address string, pubKey, privKey []byte) error {
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return err
 	}
 	files := []struct {
 		name string
-		data string
+		data []byte
 		mode os.FileMode
 	}{
-		{name: "address.txt", data: address + "\n", mode: 0o644},
-		{name: "pubkey.hex", data: pubKeyHex + "\n", mode: 0o600},
-		{name: "privkey.hex", data: privKeyHex + "\n", mode: 0o600},
+		{name: "address.txt", data: []byte(address + "\n"), mode: 0o644},
+		{name: "pubkey.hex", data: []byte(hex.EncodeToString(pubKey) + "\n"), mode: 0o600},
+		{name: "privkey.hex", data: []byte(hex.EncodeToString(privKey) + "\n"), mode: 0o600},
+		// Raw binary forms consumed by geth (--pqvotekey) and by the pq key
+		// registry precompile. Emitting these alongside the hex files keeps
+		// the tool a single source of truth for both human-readable and
+		// machine-readable key material.
+		{name: "pubkey.bin", data: pubKey, mode: 0o600},
+		{name: "privkey.bin", data: privKey, mode: 0o600},
 	}
 	for _, file := range files {
-		if err := os.WriteFile(filepath.Join(outDir, file.name), []byte(file.data), file.mode); err != nil {
+		if err := os.WriteFile(filepath.Join(outDir, file.name), file.data, file.mode); err != nil {
 			return err
 		}
 	}

@@ -27,9 +27,25 @@ function create_validator() {
   rm -rf ${workspace}/.local
   mkdir -p ${workspace}/.local
 
+  # Ensure gen-pq-account is built (deterministic PQ validator keys).
+  if [ ! -x "${workspace}/tools/gen-pq-account/gen-pq-account" ]; then
+    (cd ${workspace}/tools/gen-pq-account && go build .)
+  fi
+
   for ((i = 0; i < size; i++)); do
     cp -r ${workspace}/keys/validator${i} ${workspace}/.local/
     cp -r ${workspace}/keys/bls${i} ${workspace}/.local/
+
+    # Generate a per-validator ML-DSA-44 key from a deterministic seed so the
+    # same cluster layout always produces the same PQ vote identities.
+    # gen-pq-account writes both hex and raw-binary forms; geth --pqvotekey
+    # consumes privkey.bin directly.
+    pq_seed=$(printf 'pq-validator-%d' ${i} | xxd -p -c 256)
+    pq_outdir=${workspace}/.local/pq${i}
+    rm -rf ${pq_outdir}
+    ${workspace}/tools/gen-pq-account/gen-pq-account \
+      -seed ${pq_seed} \
+      -out ${pq_outdir} >/dev/null
   done
 }
 
@@ -88,6 +104,19 @@ function prepare_config() {
     mv ${workspace}/.local/bls${i}/bls ./ && rm -rf ${workspace}/.local/bls${i}
     vote_addr=0x$(cat ./bls/keystore/*json | jq .pubkey | sed 's/"//g')
     echo "${cons_addr},${bbcfee_addrs},${fee_addr},${powers},${vote_addr}" >>${workspace}/genesis/validators.conf
+
+    # Copy keystore into node dir early so inject_pq_genesis.py can read
+    # the consensus address before initNetwork moves the original.
+    cp -r ${workspace}/.local/validator${i}/keystore ./
+
+    # Stage the PQ vote key under the validator datadir so --pqvotekey can
+    # pick it up at startup. ML-DSA-44 replaces BLS vote signing post-PQFork.
+    mkdir -p ./pq
+    mv ${workspace}/.local/pq${i}/privkey.bin ./pq/privkey.bin
+    mv ${workspace}/.local/pq${i}/pubkey.bin  ./pq/pubkey.bin
+    mv ${workspace}/.local/pq${i}/pubkey.hex  ./pq/pubkey.hex
+    mv ${workspace}/.local/pq${i}/address.txt ./pq/address.txt
+    rm -rf ${workspace}/.local/pq${i}
     if [ ${EnableSentryNode} = true ]; then
       mkdir -p ${workspace}/.local/sentry${i}
     fi
@@ -122,6 +151,16 @@ function prepare_config() {
     --init-minimal-delay "1 minutes" \
     --token-recover-portal-protector "${INIT_HOLDER}"
   cp genesis-dev.json genesis.json
+
+  # Pre-populate the pqKeyRegistry (0x70) storage in genesis so that every
+  # validator's ML-DSA-44 pubkey is available from block 0.  Without this the
+  # PQ vote manager cannot match its signer key to an active validator.
+  node_dirs=""
+  for ((i = 0; i < size; i++)); do
+    node_dirs="${node_dirs} ${workspace}/.local/node${i}"
+  done
+  poetry run python3 ${workspace}/tools/inject_pq_genesis.py \
+    ${workspace}/genesis/genesis.json ${node_dirs}
 }
 
 function initNetwork() {
@@ -129,7 +168,7 @@ function initNetwork() {
   for ((i = 0; i < size; i++)); do
     mkdir ${workspace}/.local/node${i}/geth
     cp ${workspace}/keys/validator-nodekey${i} ${workspace}/.local/node${i}/geth/nodekey
-    mv ${workspace}/.local/validator${i}/keystore ${workspace}/.local/node${i}/ && rm -rf ${workspace}/.local/validator${i}
+    rm -rf ${workspace}/.local/node${i}/keystore && mv ${workspace}/.local/validator${i}/keystore ${workspace}/.local/node${i}/ && rm -rf ${workspace}/.local/validator${i}
     if [ ${EnableSentryNode} = true ]; then
       mkdir ${workspace}/.local/sentry${i}/geth
       cp ${workspace}/keys/sentry-nodekey${i} ${workspace}/.local/sentry${i}/geth/nodekey
@@ -225,7 +264,7 @@ function start_node() {
     --override.breatheblockinterval ${BreatheBlockInterval} \
     --override.minforblobrequest ${MinBlocksForBlobRequests} \
     --override.defaultextrareserve ${DefaultExtraReserveForBlobRequests} \
-    $([ "${type}" = "node" ] && echo "--mine --vote --unlock ${cons_addr} --miner.etherbase ${cons_addr} --password ${datadir}/password.txt --blspassword ${datadir}/password.txt") \
+    $([ "${type}" = "node" ] && echo "--mine --pqvotekey ${datadir}/pq/privkey.bin --unlock ${cons_addr} --miner.etherbase ${cons_addr} --password ${datadir}/password.txt") \
     >>${datadir}/bsc-node.log 2>&1 &
 }
 
