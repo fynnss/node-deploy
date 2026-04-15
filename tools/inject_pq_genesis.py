@@ -100,9 +100,12 @@ def main():
             break
     if registry_key is None:
         registry_key = PQ_REGISTRY_ADDR
-        alloc[registry_key] = {"balance": "0x0"}
+        alloc[registry_key] = {"balance": "0x0", "nonce": "0x1"}
 
     registry_entry = alloc[registry_key]
+    # Ensure nonce is set so EIP-158 does not treat 0x70 as empty and wipe its storage.
+    if "nonce" not in registry_entry or registry_entry["nonce"] in ("0x0", "0x00", 0):
+        registry_entry["nonce"] = "0x1"
     storage = registry_entry.setdefault("storage", {})
 
     for node_dir in node_dirs:
