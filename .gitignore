@@ -9,3 +9,7 @@
 
 .idea/
 lib/
+
+keys/
+.venv/
+.python-version
